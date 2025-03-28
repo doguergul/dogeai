@@ -14,4 +14,7 @@ lightgbm>=4.1.0
 prophet>=1.1.4
 tqdm>=4.65.0
 torch>=2.0.0
-transformers>=4.30.0 
+transformers>=4.30.0
+
+# Optional dependencies
+# calplot>=0.1.7  # For calendar heatmaps of time series data 

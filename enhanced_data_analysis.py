@@ -15,6 +15,7 @@ import warnings
 import base64
 import matplotlib.gridspec as gridspec
 import inspect
+from sklearn.model_selection import train_test_split  # Added to resolve the train_test_split import
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -1027,30 +1028,46 @@ class EnhancedDataAnalyzer:
         
         # If we have calplot, use it, otherwise use a custom approach
         try:
-            import calplot
-            calplot.calplot(date_df['count'], cmap='YlGnBu', 
-                          yearascending=True, daylabels='MTWTFSS')
-            plt.title(f"Calendar Heatmap of Records by {date_col}")
-        except ImportError:
-            # Fall back to a simple heatmap by day of week and week number
-            date_df['day_of_week'] = date_df.index.dayofweek
-            date_df['week_of_year'] = date_df.index.isocalendar().week
+            # Import calplot only when needed to avoid issues if not installed
+            calplot = None
+            try:
+                import calplot
+            except ImportError:
+                logging.warning("calplot package not found, using fallback visualization method")
             
-            # Pivot to create day-of-week vs week-of-year
-            pivot_df = date_df.pivot_table(
-                index='day_of_week', 
-                columns='week_of_year', 
-                values='count', 
-                aggfunc='sum',
-                fill_value=0
-            )
-            
-            # Create heatmap
-            sns.heatmap(pivot_df, cmap='YlGnBu', cbar_kws={'label': 'Record Count'})
-            plt.title(f"Records by Week and Day of Week ({date_col})")
-            plt.xlabel("Week of Year")
-            plt.ylabel("Day of Week")
-            plt.yticks(np.arange(7) + 0.5, ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
+            if calplot:
+                calplot.calplot(date_df['count'], cmap='YlGnBu', 
+                              yearascending=True, daylabels='MTWTFSS')
+                plt.title(f"Calendar Heatmap of Records by {date_col}")
+            else:
+                # Fall back to a simple heatmap by day of week and week number
+                date_df['day_of_week'] = date_df.index.dayofweek
+                date_df['week_of_year'] = date_df.index.isocalendar().week
+                
+                # Pivot to create day-of-week vs week-of-year
+                pivot_df = date_df.pivot_table(
+                    index='day_of_week', 
+                    columns='week_of_year', 
+                    values='count', 
+                    aggfunc='sum',
+                    fill_value=0
+                )
+                
+                # Create heatmap
+                sns.heatmap(pivot_df, cmap='YlGnBu', cbar_kws={'label': 'Record Count'})
+                plt.title(f"Records by Week and Day of Week ({date_col})")
+                plt.xlabel("Week of Year")
+                plt.ylabel("Day of Week")
+                plt.yticks(np.arange(7) + 0.5, ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
+        except Exception as e:
+            logging.warning(f"Error creating calendar heatmap: {str(e)}")
+            # Fall back to a simple bar chart
+            monthly_counts = date_df.resample('M')['count'].sum()
+            plt.bar(monthly_counts.index, monthly_counts.values)
+            plt.title(f"Monthly Record Counts for {date_col}")
+            plt.xlabel("Month")
+            plt.ylabel("Record Count")
+            plt.xticks(rotation=45)
         
         plt.tight_layout()
         self._save_figure(f"{date_col}_calendar_heatmap", subdir="TimeSeries")
