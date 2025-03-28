@@ -17,4 +17,4 @@ torch>=2.0.0
 transformers>=4.30.0
 
 # Optional dependencies
-# calplot>=0.1.7  # For calendar heatmaps of time series data 
+calplot>=0.1.7  # For calendar heatmaps of time series data 

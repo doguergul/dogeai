@@ -17,6 +17,13 @@ import matplotlib.gridspec as gridspec
 import inspect
 from sklearn.model_selection import train_test_split  # Added to resolve the train_test_split import
 
+# Type hint for calplot to help Pylance
+# This tells the type checker that calplot exists even if not imported yet
+try:
+    import calplot  # type: ignore
+except ImportError:
+    calplot = None  # type: ignore
+
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
@@ -1028,14 +1035,8 @@ class EnhancedDataAnalyzer:
         
         # If we have calplot, use it, otherwise use a custom approach
         try:
-            # Import calplot only when needed to avoid issues if not installed
-            calplot = None
-            try:
-                import calplot
-            except ImportError:
-                logging.warning("calplot package not found, using fallback visualization method")
-            
-            if calplot:
+            # Use the global calplot variable defined at the top of the file
+            if calplot is not None:
                 calplot.calplot(date_df['count'], cmap='YlGnBu', 
                               yearascending=True, daylabels='MTWTFSS')
                 plt.title(f"Calendar Heatmap of Records by {date_col}")
