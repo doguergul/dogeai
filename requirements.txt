@@ -9,12 +9,14 @@ statsmodels>=0.13.0
 requests>=2.28.0
 gpt4all>=0.3.0
 llama-cpp-python>=0.2.11
-xgboost>=2.0.0
-lightgbm>=4.1.0
-prophet>=1.1.4
-tqdm>=4.65.0
-torch>=2.0.0
-transformers>=4.30.0
+
+# Performance optimizations
+numba>=0.56.0  # JIT compilation for faster numerical operations
+joblib>=1.2.0  # Parallel computing tools
+psutil>=5.9.0  # Process and system utilities
+tqdm>=4.64.0   # Progress bars
 
 # Optional dependencies
-calplot>=0.1.7  # For calendar heatmaps of time series data 
+calplot>=0.1.7  # For calendar heatmaps of time series data
+pyarrow>=7.0.0  # For faster pandas operations
+fastparquet>=0.8.0  # For faster data I/O 

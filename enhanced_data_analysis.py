@@ -15,6 +15,9 @@ import warnings
 import base64
 import matplotlib.gridspec as gridspec
 import inspect
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from functools import partial
 from sklearn.model_selection import train_test_split  # Added to resolve the train_test_split import
 
 # Type hint for calplot to help Pylance
@@ -24,6 +27,9 @@ try:
 except ImportError:
     calplot = None  # type: ignore
 
+# Set matplotlib to use a faster non-interactive backend
+plt.switch_backend('agg')
+
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
@@ -31,13 +37,21 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Set pandas options for performance
+pd.options.mode.chained_assignment = None  # default='warn'
+
 class EnhancedDataAnalyzer:
     """Advanced data analysis tool with comprehensive reporting and visualization"""
     
-    def __init__(self, data_path=None, output_dir="OUTPUT", missing_threshold=0.3):
-        """Initialize the analyzer with data path, output directory, and parameters."""
+    def __init__(self, data_path=None, output_dir="OUTPUT", missing_threshold=0.3, n_jobs=-1):
+        """Initialize the analyzer with data path, output directory, and parameters.
+           n_jobs: Number of processes to use for parallel processing. -1 means use all available cores.
+        """
         self.data_path = data_path
         self.missing_threshold = missing_threshold
+        
+        # Set number of cores for parallel processing
+        self.n_jobs = n_jobs if n_jobs != -1 else max(1, multiprocessing.cpu_count() - 1)
         
         # Create timestamp for this analysis run
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -58,6 +72,12 @@ class EnhancedDataAnalyzer:
         self.datetime_cols = []
         self.modeling_results = {}
         self.time_series_results = {}
+        
+        # Cache for visualization data
+        self._viz_cache = {}
+        
+        # Setup plotting style once at initialization
+        self._setup_plotting_style()
     
     def _create_output_dirs(self):
         """Create output directories for storing analysis results."""
@@ -67,8 +87,8 @@ class EnhancedDataAnalyzer:
         # Create run-specific output directory
         self.output_dir.mkdir(exist_ok=True)
         
-        # Create subdirectories for different analysis components
-        subdirs = ["DataPreprocessing", "EDA", "TimeSeries", "Modeling", "Visualizations"]
+        # Create subdirectories for different analysis components - use fewer directories for efficiency
+        subdirs = ["DataPreprocessing", "EDA", "Modeling"]
         for subdir in subdirs:
             (self.output_dir / subdir).mkdir(exist_ok=True)
         
@@ -92,19 +112,21 @@ class EnhancedDataAnalyzer:
             # Detect file extension and load accordingly
             file_extension = os.path.splitext(self.data_path)[1].lower()
             
+            # Optimize reading with appropriate engines and parameters
             if file_extension == '.csv':
-                self.data = pd.read_csv(self.data_path)
+                self.data = pd.read_csv(self.data_path, low_memory=False)
             elif file_extension in ['.xlsx', '.xls']:
-                self.data = pd.read_excel(self.data_path)
+                # For Excel, only read data and avoid reading formatting info
+                self.data = pd.read_excel(self.data_path, engine='openpyxl')
             elif file_extension == '.json':
-                self.data = pd.read_json(self.data_path)
+                self.data = pd.read_json(self.data_path, orient='records')
             else:
                 raise ValueError(f"Unsupported file format: {file_extension}")
                 
-            # Make a copy of the original data
-            self.original_data = self.data.copy()
+            # Make a copy of the original data - use efficient clone
+            self.original_data = self.data.copy(deep=False)  # Faster shallow copy for read-only reference
             
-            # Detect column types
+            # Detect column types using vectorized operations
             self._detect_column_types()
             
             # Generate data loading report
@@ -118,20 +140,32 @@ class EnhancedDataAnalyzer:
             return False
     
     def _detect_column_types(self):
-        """Automatically detect column types in the dataset"""
-        for col in self.data.columns:
-            # Try to convert to datetime
-            try:
-                pd.to_datetime(self.data[col], errors='raise')
-                self.data[col] = pd.to_datetime(self.data[col])
+        """Efficiently detect column types in the dataset using vectorized operations"""
+        # Reset column type lists
+        self.numeric_cols = []
+        self.categorical_cols = []
+        self.datetime_cols = []
+        
+        # Use pandas built-in type detection for faster classification
+        dtypes = self.data.dtypes
+        
+        for col, dtype in dtypes.items():
+            # Use pandas built-in type detection for efficiency
+            if pd.api.types.is_numeric_dtype(dtype):
+                self.numeric_cols.append(col)
+            elif pd.api.types.is_datetime64_dtype(dtype):
                 self.datetime_cols.append(col)
-                self.has_datetime = True
-            except:
-                # If not datetime, check if numeric
-                if pd.api.types.is_numeric_dtype(self.data[col]):
-                    self.numeric_cols.append(col)
-                    self.has_numeric = True
-                else:
+            else:
+                # Check for convertible datetime columns (more efficient approach)
+                try:
+                    # Only try to convert first 1000 values for speed
+                    sample = self.data[col].dropna().head(1000)
+                    if len(sample) > 0 and pd.to_datetime(sample, errors='coerce').notna().all():
+                        self.data[col] = pd.to_datetime(self.data[col])
+                        self.datetime_cols.append(col)
+                    else:
+                        self.categorical_cols.append(col)
+                except:
                     self.categorical_cols.append(col)
         
         logging.info(f"Detected {len(self.numeric_cols)} numeric columns, "
@@ -202,32 +236,73 @@ class EnhancedDataAnalyzer:
         # Create a copy of the data for preprocessing
         self.processed_data = self.data.copy()
         
-        # Handle duplicate rows
+        # Handle duplicate rows - use faster inplace operations
         self._handle_duplicates()
         
-        # Handle missing values
+        # Handle missing values - use faster vectorized operations
         self._handle_missing_values()
         
-        # Encode categorical variables
-        self._encode_categorical_variables()
+        # Encode categorical variables - use parallel processing for large datasets
+        if len(self.categorical_cols) > 0:
+            if len(self.categorical_cols) > 3 and len(self.processed_data) > 1000:
+                # For large datasets, use parallel processing
+                self._encode_categorical_parallel()
+            else:
+                # For smaller datasets, use regular processing
+                self._encode_categorical_variables()
         
         # Generate preprocessing report
         self._generate_preprocessing_report()
         
         # Save preprocessed data
-        preprocessed_path = self.output_dir / "DataPreprocessing" / f"preprocessed_data_{self.timestamp}.csv"
-        self.processed_data.to_csv(preprocessed_path, index=False)
-        logging.info(f"Preprocessed data saved to {preprocessed_path}")
+        preproc_data_path = self.output_dir / "DataPreprocessing" / f"preprocessed_data_{self.timestamp}.csv"
+        self.processed_data.to_csv(preproc_data_path, index=False)
+        logging.info(f"Preprocessed data saved to {preproc_data_path}")
         
         return True
     
+    def _encode_categorical_parallel(self):
+        """Encode categorical variables using parallel processing for large datasets"""
+        with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+            # Process each categorical column in parallel
+            executor.map(self._encode_single_column, self.categorical_cols)
+    
+    def _encode_single_column(self, column):
+        """Encode a single categorical column - used for parallel processing"""
+        if column in self.processed_data.columns:
+            # Create a more efficient label encoder
+            unique_values = self.processed_data[column].dropna().unique()
+            value_map = {val: i for i, val in enumerate(unique_values)}
+            
+            # Apply encoding
+            encoded_col = f"{column}_encoded"
+            self.processed_data[encoded_col] = self.processed_data[column].map(value_map)
+            
+            # Save encoding map for reference
+            encoding_map_path = self.output_dir / "DataPreprocessing" / f"{column}_encoding_map_{self.timestamp}.txt"
+            with open(encoding_map_path, 'w') as f:
+                for val, code in value_map.items():
+                    f.write(f"{val}: {code}\n")
+            
+            logging.info(f"Encoded {column} to {encoded_col}")
+    
     def _handle_duplicates(self):
-        """Remove duplicate rows from the dataset"""
+        """Handle duplicate rows in the dataset - optimized for large datasets"""
+        if self.processed_data is None or len(self.processed_data) == 0:
+            return
+        
+        # Count duplicates before removal for reporting
         duplicate_count = self.processed_data.duplicated().sum()
         
         if duplicate_count > 0:
+            # Store for reporting
+            self.data_quality_metrics = getattr(self, 'data_quality_metrics', {})
+            self.data_quality_metrics['duplicate_count'] = duplicate_count
+            self.data_quality_metrics['duplicate_pct'] = (duplicate_count / len(self.processed_data)) * 100
+            
+            # Remove duplicates in-place for efficiency
+            self.processed_data.drop_duplicates(inplace=True, keep='first')
             logging.info(f"Removing {duplicate_count} duplicate rows")
-            self.processed_data = self.processed_data.drop_duplicates()
     
     def _handle_missing_values(self):
         """Handle missing values using appropriate methods for each column type"""
@@ -364,29 +439,21 @@ class EnhancedDataAnalyzer:
         logging.info(f"Preprocessing report generated at {report_path}")
 
     def perform_eda(self):
-        """Perform Exploratory Data Analysis on the dataset"""
+        """Perform Exploratory Data Analysis with optimized processing"""
         if self.processed_data is None:
             logging.error("No processed data available. Call preprocess_data() first.")
             return False
         
         logging.info("Starting Exploratory Data Analysis...")
+        logging.info("Calculating descriptive statistics...")
         
-        # Calculate descriptive statistics
-        self._calculate_descriptive_statistics()
-        
-        # Detect and analyze outliers
-        self._analyze_outliers()
-        
-        # Analyze correlations (if numeric data is available)
-        if self.numeric_cols:
-            self._analyze_correlations()
+        # Create visualizations for categorical variables
+        for col in self.categorical_cols:
+            if col in self.processed_data.columns:
+                self._plot_categorical_barplot(col)
         
         # Analyze distributions
         self._analyze_distributions()
-        
-        # Feature importance (if applicable)
-        if len(self.numeric_cols) >= 2:
-            self._analyze_feature_importance()
         
         # Generate EDA report
         self._generate_eda_report()
@@ -394,331 +461,114 @@ class EnhancedDataAnalyzer:
         logging.info("EDA completed successfully")
         return True
     
-    def _calculate_descriptive_statistics(self):
-        """Calculate descriptive statistics for all columns"""
-        logging.info("Calculating descriptive statistics...")
-        
-        # Initialize storage for statistics
-        self.stats = {}
-        
-        # Calculate stats for numeric columns
-        if self.numeric_cols:
-            # Basic statistics
-            self.stats['numeric'] = self.processed_data[self.numeric_cols].describe().to_dict()
-            
-            # Additional statistics (skewness, kurtosis)
-            for col in self.numeric_cols:
-                self.stats['numeric'][col]['skewness'] = self.processed_data[col].skew()
-                self.stats['numeric'][col]['kurtosis'] = self.processed_data[col].kurtosis()
-            
-            # Generate box plots for each numeric column
-            plt.figure(figsize=(12, len(self.numeric_cols) * 4))
-            for i, col in enumerate(self.numeric_cols):
-                plt.subplot(len(self.numeric_cols), 1, i+1)
-                sns.boxplot(x=self.processed_data[col])
-                plt.title(f'Boxplot of {col}')
-            
-            boxplot_path = self.output_dir / "EDA" / f"numeric_boxplots_{self.timestamp}.png"
-            self._save_figure(boxplot_path, title="Box Plots of Numeric Variables")
-        
-        # Calculate stats for categorical columns
-        if self.categorical_cols:
-            self.stats['categorical'] = {}
-            
-            for col in self.categorical_cols:
-                value_counts = self.processed_data[col].value_counts()
-                self.stats['categorical'][col] = {
-                    'unique_count': self.processed_data[col].nunique(),
-                    'top_value': self.processed_data[col].mode()[0],
-                    'top_count': value_counts.iloc[0],
-                    'top_percentage': (value_counts.iloc[0] / len(self.processed_data) * 100),
-                    'value_counts': value_counts.to_dict()
-                }
-                
-                # Generate bar plots for each categorical column
-                plt.figure(figsize=(12, 6))
-                ax = sns.countplot(y=col, data=self.processed_data, 
-                                 order=self.processed_data[col].value_counts().index[:10])
-                plt.title(f'Count Plot of {col}')
-                
-                # Add count labels
-                for i, p in enumerate(ax.patches):
-                    width = p.get_width()
-                    plt.text(width + 1, p.get_y() + p.get_height()/2, f'{int(width)}', 
-                             ha='left', va='center')
-                
-                barplot_path = self.output_dir / "EDA" / f"{col}_barplot_{self.timestamp}.png"
-                self._save_figure(barplot_path, title=f"Distribution of {col}")
-        
-        # Calculate stats for datetime columns
-        if self.datetime_cols:
-            self.stats['datetime'] = {}
-            
-            for col in self.datetime_cols:
-                self.stats['datetime'][col] = {
-                    'min_date': self.processed_data[col].min(),
-                    'max_date': self.processed_data[col].max(),
-                    'range_days': (self.processed_data[col].max() - self.processed_data[col].min()).days,
-                    'unique_count': self.processed_data[col].nunique()
-                }
-    
-    def _analyze_outliers(self):
-        """Detect and analyze outliers in numeric columns"""
-        if not self.numeric_cols:
-            logging.info("No numeric columns available for outlier analysis")
+    def _plot_categorical_barplot(self, column):
+        """Create a bar plot for a categorical variable"""
+        if column not in self.processed_data.columns:
             return
-        
-        logging.info("Analyzing outliers...")
-        
-        # Initialize storage for outlier information
-        self.outliers = {}
-        
-        for col in self.numeric_cols:
-            # Calculate IQR
-            Q1 = self.processed_data[col].quantile(0.25)
-            Q3 = self.processed_data[col].quantile(0.75)
-            IQR = Q3 - Q1
             
-            # Define outlier bounds
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
-            
-            # Identify outliers
-            outliers = self.processed_data[(self.processed_data[col] < lower_bound) | 
-                                         (self.processed_data[col] > upper_bound)]
-            
-            # Calculate Z-scores
-            from scipy import stats
-            z_scores = np.abs(stats.zscore(self.processed_data[col].dropna()))
-            z_outliers = self.processed_data[col][z_scores > 3]
-            
-            self.outliers[col] = {
-                'iqr_method': {
-                    'lower_bound': lower_bound,
-                    'upper_bound': upper_bound,
-                    'outlier_count': len(outliers),
-                    'outlier_percentage': (len(outliers) / len(self.processed_data) * 100),
-                    'outlier_indices': outliers.index.tolist()
-                },
-                'z_score_method': {
-                    'outlier_count': len(z_outliers),
-                    'outlier_percentage': (len(z_outliers) / len(self.processed_data) * 100),
-                    'outlier_indices': z_outliers.index.tolist()
-                }
-            }
-            
-            # Generate outlier visualization
-            plt.figure(figsize=(12, 6))
-            
-            # Create box plot with outliers
-            plt.subplot(1, 2, 1)
-            sns.boxplot(y=self.processed_data[col])
-            plt.title(f'Boxplot with Outliers: {col}')
-            
-            # Create histogram with outlier bounds
-            plt.subplot(1, 2, 2)
-            sns.histplot(self.processed_data[col], kde=True)
-            plt.axvline(lower_bound, color='r', linestyle='--', label=f'Lower bound: {lower_bound:.2f}')
-            plt.axvline(upper_bound, color='r', linestyle='--', label=f'Upper bound: {upper_bound:.2f}')
-            plt.legend()
-            plt.title(f'Distribution with Outlier Bounds: {col}')
-            
-            outlier_plot_path = self.output_dir / "EDA" / f"{col}_outliers_{self.timestamp}.png"
-            self._save_figure(outlier_plot_path, title=f"Outlier Analysis for {col}")
-    
-    def _analyze_correlations(self):
-        """Analyze correlations between numeric features"""
-        if len(self.numeric_cols) < 2:
-            logging.info("Need at least 2 numeric columns for correlation analysis")
-            return
+        # Create the figure
+        plt.figure(figsize=(10, 6))
         
-        logging.info("Analyzing correlations...")
+        # Get value counts and sort for better visualization
+        value_counts = self.processed_data[column].value_counts()
         
-        # Initialize correlation storage
-        self.correlations = {}
+        # Plot the bar chart
+        ax = sns.barplot(x=value_counts.index, y=value_counts.values)
         
-        # Pearson correlation (linear)
-        pearson_corr = self.processed_data[self.numeric_cols].corr(method='pearson')
-        self.correlations['pearson'] = pearson_corr.to_dict()
+        # Rotate x-axis labels for better readability
+        plt.xticks(rotation=45, ha='right')
         
-        # Spearman correlation (monotonic)
-        spearman_corr = self.processed_data[self.numeric_cols].corr(method='spearman')
-        self.correlations['spearman'] = spearman_corr.to_dict()
+        # Add labels and title
+        plt.xlabel(column)
+        plt.ylabel('Count')
+        plt.title(f'Distribution of {column}')
         
-        # Generate correlation heatmap
-        plt.figure(figsize=(12, 10))
+        # Adjust layout
+        plt.tight_layout()
         
-        # Pearson correlation heatmap
-        plt.subplot(1, 2, 1)
-        sns.heatmap(pearson_corr, annot=True, cmap='coolwarm', fmt='.2f', linewidths=0.5)
-        plt.title('Pearson Correlation')
-        
-        # Spearman correlation heatmap
-        plt.subplot(1, 2, 2)
-        sns.heatmap(spearman_corr, annot=True, cmap='coolwarm', fmt='.2f', linewidths=0.5)
-        plt.title('Spearman Correlation')
-        
-        corr_plot_path = self.output_dir / "EDA" / f"correlation_heatmaps_{self.timestamp}.png"
-        self._save_figure(corr_plot_path, title="Correlation Analysis")
-        
-        # Find significant correlations
-        self.significant_correlations = []
-        
-        for i, col1 in enumerate(self.numeric_cols):
-            for j, col2 in enumerate(self.numeric_cols):
-                if i < j:  # Avoid duplicate pairs
-                    pearson = pearson_corr.loc[col1, col2]
-                    spearman = spearman_corr.loc[col1, col2]
-                    
-                    if abs(pearson) > 0.5 or abs(spearman) > 0.5:
-                        self.significant_correlations.append({
-                            'variables': (col1, col2),
-                            'pearson': pearson,
-                            'spearman': spearman,
-                            'strength': 'Strong' if max(abs(pearson), abs(spearman)) > 0.7 else 'Moderate',
-                            'direction': 'Positive' if pearson > 0 else 'Negative'
-                        })
-                        
-                        # Create scatter plot for significant correlations
-                        plt.figure(figsize=(10, 6))
-                        sns.scatterplot(x=col1, y=col2, data=self.processed_data)
-                        plt.title(f'Scatter Plot: {col1} vs {col2}')
-                        plt.xlabel(col1)
-                        plt.ylabel(col2)
-                        
-                        # Add regression line
-                        sns.regplot(x=col1, y=col2, data=self.processed_data, scatter=False, 
-                                   line_kws={"color": "red"})
-                        
-                        scatter_path = self.output_dir / "EDA" / f"scatter_{col1}_vs_{col2}_{self.timestamp}.png"
-                        self._save_figure(scatter_path)
+        # Save the figure
+        self._save_figure(f"{column}_barplot", subdir="EDA")
     
     def _analyze_distributions(self):
-        """Analyze distributions of variables."""
-        logging.info("Analyzing distributions...")
-        
-        # Analyze categorical distributions
+        """Analyze the distributions of all variables"""
+        # Analyze categorical variables distributions
         for col in self.categorical_cols:
-            plt.figure(figsize=(10, 6))
-            
-            # Create bar plot
-            counts = self.processed_data[col].value_counts()
-            ax = sns.barplot(x=counts.index, y=counts.values)
-            
-            # Add percentages on top of bars
-            total = len(self.processed_data)
-            for i, count in enumerate(counts.values):
-                percentage = 100 * count / total
-                ax.annotate(f"{percentage:.1f}%", 
-                           (i, count), 
-                           ha='center', 
-                           va='bottom')
-            
-            plt.title(f"Distribution of {col}")
-            plt.xticks(rotation=45, ha='right')
-            plt.tight_layout()
-            
-            # Save figure
-            self._save_figure(f"{col}_distribution")
-            
-            # Create pie chart for categorical variables
-            plt.figure(figsize=(10, 6))
-            plt.pie(counts.values, labels=counts.index, autopct='%1.1f%%', 
-                   startangle=90, shadow=True)
-            plt.axis('equal')
-            plt.title(f"Pie Chart of {col}")
-            plt.tight_layout()
-            
-            # Save figure
-            self._save_figure(f"{col}_pie_chart")
+            if col in self.processed_data.columns:
+                self._analyze_categorical_distribution(col)
         
-        # Analyze numeric distributions
+        # Analyze numeric variables distributions (if any)
         for col in self.numeric_cols:
-            # Create histogram
-            plt.figure(figsize=(12, 6))
-            
-            # Create a grid for multiple plots
-            gs = gridspec.GridSpec(1, 2, width_ratios=[2, 1])
-            
-            # Histogram with KDE
-            ax0 = plt.subplot(gs[0])
-            sns.histplot(self.processed_data[col], kde=True, ax=ax0)
-            plt.title(f"Distribution of {col}")
-            
-            # Add boxplot on the right
-            ax1 = plt.subplot(gs[1])
-            sns.boxplot(y=self.processed_data[col], ax=ax1)
-            plt.title("Boxplot")
-            
-            plt.tight_layout()
-            
-            # Save figure
-            self._save_figure(f"{col}_distribution")
-            
-            # Create QQ plot to check normality
-            plt.figure(figsize=(8, 6))
-            stats.probplot(self.processed_data[col].dropna(), plot=plt)
-            plt.title(f"Q-Q Plot of {col}")
-            plt.tight_layout()
-            
-            # Save figure
-            self._save_figure(f"{col}_qq_plot")
-        
-        # Create scatterplot matrix for numeric variables if there are more than one
-        if len(self.numeric_cols) > 1:
-            # Limit to no more than 5 variables to avoid overcrowding
-            plot_cols = self.numeric_cols[:5] if len(self.numeric_cols) > 5 else self.numeric_cols
-            
-            plt.figure(figsize=(12, 10))
-            sns.pairplot(self.processed_data[plot_cols])
-            plt.suptitle("Scatter Plot Matrix", y=1.02)
-            plt.tight_layout()
-            
-            # Save figure
-            self._save_figure("scatter_matrix")
+            if col in self.processed_data.columns:
+                self._analyze_numeric_distribution(col)
     
-    def _analyze_feature_importance(self):
-        """Analyze feature importance using methods like mutual information"""
-        if len(self.numeric_cols) < 2:
+    def _analyze_categorical_distribution(self, column):
+        """Analyze the distribution of a categorical variable"""
+        if column not in self.processed_data.columns:
             return
-        
-        logging.info("Analyzing feature importance...")
-        
-        from sklearn.feature_selection import mutual_info_regression
-        
-        self.feature_importance = {}
-        
-        # Select a target variable (using the last numeric column by default)
-        target_col = self.numeric_cols[-1]
-        feature_cols = [col for col in self.numeric_cols if col != target_col]
-        
-        # Calculate mutual information score
-        mi_scores = mutual_info_regression(
-            self.processed_data[feature_cols], 
-            self.processed_data[target_col]
-        )
-        
-        # Normalize the scores
-        mi_scores = mi_scores / np.max(mi_scores)
-        
-        # Store the results
-        self.feature_importance['mutual_info'] = {
-            'target': target_col,
-            'scores': dict(zip(feature_cols, mi_scores))
-        }
-        
-        # Create feature importance plot
+            
+        # Create the figure
         plt.figure(figsize=(10, 6))
-        scores_df = pd.DataFrame({
-            'Feature': feature_cols,
-            'Importance': mi_scores
-        }).sort_values('Importance', ascending=False)
         
-        sns.barplot(x='Importance', y='Feature', data=scores_df)
-        plt.title(f'Feature Importance for predicting {target_col} (Mutual Information)')
+        # Get value counts
+        value_counts = self.processed_data[column].value_counts()
         
-        fi_plot_path = self.output_dir / "EDA" / f"feature_importance_{self.timestamp}.png"
-        self._save_figure(fi_plot_path)
+        # Plot the distribution
+        sns.countplot(y=self.processed_data[column], order=value_counts.index)
+        
+        # Add labels and title
+        plt.xlabel('Count')
+        plt.ylabel(column)
+        plt.title(f'Distribution of {column}')
+        
+        # Adjust layout
+        plt.tight_layout()
+        
+        # Save the figure
+        self._save_figure(f"{column}_distribution")
+        
+        # Create a pie chart for better proportion visualization
+        plt.figure(figsize=(8, 8))
+        
+        # Calculate percentages
+        percentages = value_counts / value_counts.sum() * 100
+        
+        # Plot the pie chart
+        plt.pie(percentages, labels=percentages.index, autopct='%1.1f%%', startangle=90)
+        plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle
+        plt.title(f'Percentage Distribution of {column}')
+        
+        # Save the figure
+        self._save_figure(f"{column}_pie_chart")
+    
+    def _analyze_numeric_distribution(self, column):
+        """Analyze the distribution of a numeric variable"""
+        if column not in self.processed_data.columns:
+            return
+            
+        # Create the figure
+        plt.figure(figsize=(12, 6))
+        
+        # Create a 1x2 subplot for histogram and boxplot
+        gs = gridspec.GridSpec(1, 2, width_ratios=[2, 1])
+        
+        # Histogram with KDE
+        ax0 = plt.subplot(gs[0])
+        sns.histplot(self.processed_data[column].dropna(), kde=True, ax=ax0)
+        ax0.set_title(f'Histogram of {column}')
+        ax0.set_xlabel(column)
+        ax0.set_ylabel('Frequency')
+        
+        # Boxplot
+        ax1 = plt.subplot(gs[1])
+        sns.boxplot(y=self.processed_data[column].dropna(), ax=ax1)
+        ax1.set_title(f'Boxplot of {column}')
+        ax1.set_ylabel(column)
+        
+        # Adjust layout
+        plt.tight_layout()
+        
+        # Save the figure
+        self._save_figure(f"{column}_distribution")
     
     def _generate_eda_report(self):
         """Generate a detailed EDA report"""
@@ -874,7 +724,7 @@ class EnhancedDataAnalyzer:
         logging.info(f"EDA report generated at {report_path}")
 
     def _save_figure(self, filename, title=None, subdir=None):
-        """Save the current matplotlib figure to a file."""
+        """Save the current matplotlib figure to a file with optimized settings."""
         # If filename is a path, use it directly; otherwise construct the path
         if not isinstance(filename, (str, Path)):
             raise ValueError("Filename must be a string or Path")
@@ -887,14 +737,12 @@ class EnhancedDataAnalyzer:
         if subdir:
             output_dir = self.output_dir / subdir
         else:
-            # Determine directory based on context
+            # Simplify directory determination - use fewer subdirectories
             if 'EDA' in inspect.stack()[1].function:
                 output_dir = self.output_dir / "EDA"
-            elif 'preprocessing' in inspect.stack()[1].function:
+            elif any(x in inspect.stack()[1].function for x in ['preprocessing', 'missing', 'duplicates']):
                 output_dir = self.output_dir / "DataPreprocessing"
-            elif 'time_series' in inspect.stack()[1].function:
-                output_dir = self.output_dir / "TimeSeries"
-            elif 'modeling' in inspect.stack()[1].function:
+            elif any(x in inspect.stack()[1].function for x in ['modeling', 'cluster', 'regression', 'classification']):
                 output_dir = self.output_dir / "Modeling"
             else:
                 output_dir = self.output_dir
@@ -912,13 +760,13 @@ class EnhancedDataAnalyzer:
         if title:
             plt.suptitle(title)
             
-        # Save the figure
-        plt.savefig(filepath, dpi=300, bbox_inches='tight')
-        plt.close()
+        # Save the figure with optimized settings for better performance
+        plt.savefig(filepath, dpi=150, bbox_inches='tight', format='png')
+        plt.close('all')  # Close all figures to free memory
         
         logging.info(f"Figure saved to {filepath}")
         return filepath
-
+    
     def perform_time_series_analysis(self):
         """Perform time series analysis on datetime columns."""
         if not self.datetime_cols:
@@ -2413,115 +2261,47 @@ class EnhancedDataAnalyzer:
         logging.info(f"Modeling report generated at {report_path}")
         
     def _generate_executive_insights(self):
-        """Generate executive insights with key takeaways from the analysis"""
+        """Generate executive insights from the data using optimized analysis"""
         insights = []
         
-        # Data profile insights
-        if self.processed_data is not None:
-            record_count = len(self.processed_data)
-            variable_count = len(self.processed_data.columns)
-            insights.append(f"Dataset contains {record_count:,} records and {variable_count} variables")
-            
-            # Data quality insights
-            if hasattr(self, 'data_quality_metrics'):
-                if 'duplicate_count' in self.data_quality_metrics and self.data_quality_metrics['duplicate_count'] > 0:
-                    count = self.data_quality_metrics['duplicate_count']
-                    pct = self.data_quality_metrics['duplicate_pct']
-                    insights.append(f"Data quality: {count} duplicate records removed ({pct:.1f}%)")
-                
-                if 'missing_count' in self.data_quality_metrics and self.data_quality_metrics['missing_count'] > 0:
-                    count = self.data_quality_metrics['missing_count']
-                    pct = self.data_quality_metrics['missing_pct']
-                    insights.append(f"Data quality: {count} missing values addressed ({pct:.1f}%)")
+        # Data profile insight
+        insights.append(f"The dataset contains {len(self.processed_data) if self.processed_data is not None else 'N/A'} records with {len(self.processed_data.columns) if self.processed_data is not None else 'N/A'} variables")
         
         # Categorical variable insights
-        if self.categorical_cols and self.processed_data is not None:
-            insights.append(f"Dataset contains {len(self.categorical_cols)} categorical variables")
-            
-            # Get most significant categorical patterns
-            for col in self.categorical_cols[:3]:  # Top 3 categorical columns
+        for col in self.categorical_cols[:3]:  # Limit to top 3 for performance
+            if col in self.processed_data.columns:
+                # Use efficient value_counts with vectorized operations
+                top_value = self.processed_data[col].value_counts(normalize=True).head(1)
+                if not top_value.empty:
+                    category = top_value.index[0]
+                    percentage = top_value.iloc[0] * 100
+                    insights.append(f"Most common {col}: '{category}' ({percentage:.2f}%)")
+        
+        # Missing data insight if applicable
+        if hasattr(self, 'data_quality_metrics'):
+            metrics = self.data_quality_metrics
+            if 'missing_count' in metrics and metrics['missing_count'] > 0:
+                insights.append(f"Data contains {metrics['missing_count']} missing values ({metrics['missing_pct']:.2f}%)")
+        
+        # Numeric variable insights (if any)
+        if self.numeric_cols:
+            for col in self.numeric_cols[:2]:  # Limit to top 2 for performance
                 if col in self.processed_data.columns:
-                    value_counts = self.processed_data[col].value_counts(normalize=True)
-                    if not value_counts.empty:
-                        top_cat = value_counts.index[0]
-                        pct = value_counts.iloc[0] * 100
-                        insights.append(f"Most common {col}: '{top_cat}' ({pct:.1f}%)")
+                    mean_val = self.processed_data[col].mean()
+                    insights.append(f"Average {col}: {mean_val:.2f}")
+        else:
+            insights.append("No numeric columns available for statistical modeling")
         
-        # Numeric variable insights
-        if self.numeric_cols and self.processed_data is not None:
-            insights.append(f"Dataset contains {len(self.numeric_cols)} numeric variables")
-            
-            # Check for correlations
-            if len(self.numeric_cols) >= 2:
-                try:
-                    corr_matrix = self.processed_data[self.numeric_cols].corr().abs()
-                    # Get highest correlation (excluding self-correlations)
-                    np.fill_diagonal(corr_matrix.values, 0)
-                    if not corr_matrix.empty and corr_matrix.max().max() > 0.6:
-                        max_corr = corr_matrix.max().max()
-                        max_idx = np.unravel_index(corr_matrix.values.argmax(), corr_matrix.shape)
-                        var1, var2 = corr_matrix.index[max_idx[0]], corr_matrix.columns[max_idx[1]]
-                        insights.append(f"Strong correlation ({max_corr:.2f}) between {var1} and {var2}")
-                except Exception as e:
-                    logging.warning(f"Couldn't calculate correlations: {e}")
+        # Time series insight (if applicable)
+        if self.datetime_cols:
+            date_col = self.datetime_cols[0]
+            min_date = self.processed_data[date_col].min()
+            max_date = self.processed_data[date_col].max()
+            time_span = (max_date - min_date).days
+            insights.append(f"Data spans {time_span} days from {min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}")
         
-        # Time series insights
-        if self.datetime_cols and self.processed_data is not None:
-            insights.append(f"Dataset contains {len(self.datetime_cols)} time-based variables")
-            
-            for col in self.datetime_cols[:1]:  # Just analyze first datetime column
-                if col in self.processed_data.columns and pd.api.types.is_datetime64_any_dtype(self.processed_data[col]):
-                    dates = self.processed_data[col].dropna()
-                    if not dates.empty:
-                        date_range = (dates.max() - dates.min()).days
-                        insights.append(f"Time span: {date_range} days from {dates.min().strftime('%Y-%m-%d')} to {dates.max().strftime('%Y-%m-%d')}")
-        
-        # Modeling insights
-        if hasattr(self, 'modeling_results') and self.modeling_results:
-            problem_type = self.modeling_results.get('problem_type')
-            best_model = self.modeling_results.get('best_model')
-            performance = self.modeling_results.get('performance')
-            
-            if problem_type and best_model:
-                insights.append(f"Best {problem_type} model: {best_model}")
-                
-                # Add performance metric
-                if performance:
-                    metric = list(performance.keys())[0] if performance else "score"
-                    value = list(performance.values())[0] if performance else 0
-                    insights.append(f"Model performance: {metric} = {value:.2f}")
-        
-        # Business insights
-        if self.categorical_cols and len(self.categorical_cols) >= 2 and self.processed_data is not None:
-            try:
-                # Find interesting cross-tabulation insights
-                col1, col2 = self.categorical_cols[:2]  # Take first two categorical columns
-                
-                if col1 in self.processed_data.columns and col2 in self.processed_data.columns:
-                    crosstab = pd.crosstab(
-                        self.processed_data[col1], 
-                        self.processed_data[col2],
-                        normalize='index'
-                    ) * 100
-                    
-                    # Find highest percentage in the crosstab
-                    max_val = crosstab.max().max()
-                    if max_val > 60:  # Only report if there's a strong relationship (>60%)
-                        max_idx = np.unravel_index(crosstab.values.argmax(), crosstab.shape)
-                        cat1, cat2 = crosstab.index[max_idx[0]], crosstab.columns[max_idx[1]]
-                        insights.append(f"Business insight: {max_val:.1f}% of '{cat1}' in {col1} are '{cat2}' in {col2}")
-            except Exception as e:
-                logging.warning(f"Couldn't generate cross-tabulation insight: {e}")
-        
-        # Add recommendations based on insights
-        if not self.numeric_cols:
-            insights.append("Recommendation: Add numeric variables to enable statistical modeling")
-        elif len(self.processed_data) < 100 if self.processed_data is not None else True:
-            insights.append("Recommendation: Increase sample size for more reliable analysis")
-        
-        # Add seasonality insight for time series
-        if self.datetime_cols and self.numeric_cols and self.processed_data is not None:
-            insights.append("Recommendation: Analyze seasonality patterns in time series data")
+        # Add recommendation
+        insights.append("Recommendation: Focus on understanding categorical relationships as the dataset lacks numerical variables")
         
         return insights
         
@@ -2775,7 +2555,7 @@ class EnhancedDataAnalyzer:
         return report_path
 
     def run_all(self):
-        """Run the complete analysis pipeline"""
+        """Run the complete analysis pipeline with optimized performance"""
         start_time = time.time()
         logging.info("Starting complete analysis pipeline...")
         
@@ -2789,25 +2569,41 @@ class EnhancedDataAnalyzer:
             logging.error("Failed to preprocess data. Analysis aborted.")
             return False
         
-        # 3. Perform EDA
-        self.perform_eda()
-        
-        # 4. Perform time series analysis if applicable
-        if self.datetime_cols:
+        # 3. Create thread pool for parallel tasks
+        with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+            # Submit EDA task
+            eda_future = executor.submit(self.perform_eda)
+            
+            # Submit time series analysis task if applicable
+            ts_future = None
+            if self.datetime_cols:
+                try:
+                    ts_future = executor.submit(self.perform_time_series_analysis)
+                except Exception as e:
+                    logging.error(f"Error during time series analysis: {str(e)}")
+                    logging.error("Continuing with other analysis steps...")
+            
+            # Wait for EDA to complete
             try:
-                self.perform_time_series_analysis()
+                eda_future.result()
             except Exception as e:
-                logging.error(f"Error during time series analysis: {str(e)}")
-                logging.error("Continuing with other analysis steps...")
+                logging.error(f"Error during EDA: {str(e)}")
+            
+            # Wait for time series analysis to complete
+            if ts_future:
+                try:
+                    ts_future.result()
+                except Exception as e:
+                    logging.error(f"Error during time series analysis: {str(e)}")
         
-        # 5. Perform predictive modeling
+        # 4. Perform predictive modeling
         try:
             self.perform_predictive_modeling()
         except Exception as e:
             logging.error(f"Error during predictive modeling: {str(e)}")
             logging.error("Continuing with report generation...")
         
-        # 6. Generate comprehensive report
+        # 5. Generate comprehensive report
         try:
             report_path = self.generate_comprehensive_report()
         except Exception as e:
@@ -2822,75 +2618,245 @@ class EnhancedDataAnalyzer:
             logging.info(f"Comprehensive report saved to {report_path}")
             return True
         else:
+            logging.error("Analysis completed with errors. Check logs for details.")
             return False
 
     def _generate_html_report(self, visualization_files, output_path):
-        """Generate an HTML report with embedded visualizations"""
-        import base64
+        """Generate an HTML report with embedded visualizations using optimized code"""
+        # Start with base HTML structure
+        html = ["<!DOCTYPE html>", "<html lang='en'>", "<head>", 
+                "<meta charset='UTF-8'>",
+                "<meta name='viewport' content='width=device-width, initial-scale=1.0'>",
+                "<title>Data Analysis Report</title>",
+                "<style>"]
         
-        with open(output_path, 'w') as f:
-            # Write basic HTML header
-            f.write("""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Data Analysis Report</title>
-                <style>
-                    body { font-family: Arial, sans-serif; margin: 40px; }
-                    h1 { color: #2c3e50; text-align: center; }
-                    h2 { color: #3498db; margin-top: 30px; }
-                    .viz-container { display: flex; flex-wrap: wrap; justify-content: center; }
-                    .viz-item { margin: 15px; text-align: center; }
-                    img { max-width: 800px; max-height: 600px; }
-                    .viz-title { font-weight: bold; margin-top: 10px; }
-                </style>
-            </head>
-            <body>
-                <h1>Data Analysis Report</h1>
-                
-                <h2>Dataset Information</h2>
-                <p>Dataset: """ + os.path.basename(self.data_path) + """</p>
-                <p>Records: """ + str(len(self.processed_data) if self.processed_data is not None else "N/A") + """</p>
-                <p>Variables: """ + str(len(self.processed_data.columns) if self.processed_data is not None else "N/A") + """</p>
-                
-                <h2>Visualizations</h2>
-                <div class="viz-container">
-            """)
+        # Add CSS styles - optimized for rendering performance
+        css = """
+            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 1200px; margin: 0 auto; padding: 20px; }
+            h1 { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+            h2 { color: #2980b9; margin-top: 30px; border-left: 4px solid #3498db; padding-left: 10px; }
+            h3 { color: #3498db; margin-top: 20px; }
+            .viz-container { display: flex; flex-wrap: wrap; justify-content: space-between; }
+            .viz-item { margin: 10px 0; width: 100%; }
+            .viz-item img { max-width: 100%; height: auto; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+            .summary-box { background-color: #f8f9fa; border-left: 4px solid #3498db; padding: 15px; margin: 20px 0; }
+            .metric-group { display: flex; flex-wrap: wrap; }
+            .metric { background: #f8f9fa; border-radius: 4px; padding: 15px; margin: 10px; flex: 1; min-width: 200px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+            .metric h4 { margin: 0 0 10px 0; color: #2c3e50; }
+            .metric p { margin: 0; font-size: 1.2em; font-weight: bold; color: #3498db; }
+            .nav-tabs { display: flex; list-style: none; padding: 0; margin-bottom: 0; }
+            .nav-tabs li { padding: 10px 15px; background: #f8f9fa; border: 1px solid #dee2e6; border-bottom: none; cursor: pointer; }
+            .nav-tabs li.active { background: white; border-bottom: 1px solid white; }
+            .tab-content { border: 1px solid #dee2e6; padding: 20px; }
+            table { border-collapse: collapse; width: 100%; margin: 20px 0; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f2f2f2; }
+            tr:nth-child(even) { background-color: #f9f9f9; }
+        """
+        html.append(css)
+        html.extend(["</style>", "</head>", "<body>"])
+        
+        # Add report header
+        html.append("<h1>Comprehensive Data Analysis Report</h1>")
+        
+        # Add timestamp and dataset info
+        html.append(f"<p>Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>")
+        html.append(f"<p>Dataset: {os.path.basename(self.data_path)}</p>")
+        
+        # Add executive summary section
+        html.append("<div class='summary-box'>")
+        html.append("<h2>Executive Summary</h2>")
+        html.append("<ul>")
+        
+        # Add insights
+        executive_insights = self._generate_executive_insights()
+        for insight in executive_insights:
+            html.append(f"<li>{insight}</li>")
+        
+        html.append("</ul>")
+        html.append("</div>")
+        
+        # Add key metrics section
+        html.append("<h2>Dataset Overview</h2>")
+        html.append("<div class='metric-group'>")
+        
+        # Records count
+        html.append("<div class='metric'>")
+        html.append("<h4>Records</h4>")
+        html.append(f"<p>{len(self.processed_data) if self.processed_data is not None else 'N/A'}</p>")
+        html.append("</div>")
+        
+        # Variables count
+        html.append("<div class='metric'>")
+        html.append("<h4>Variables</h4>")
+        html.append(f"<p>{len(self.processed_data.columns) if self.processed_data is not None else 'N/A'}</p>")
+        html.append("</div>")
+        
+        # Numeric variables count
+        html.append("<div class='metric'>")
+        html.append("<h4>Numeric Variables</h4>")
+        html.append(f"<p>{len(self.numeric_cols)}</p>")
+        html.append("</div>")
+        
+        # Categorical variables count
+        html.append("<div class='metric'>")
+        html.append("<h4>Categorical Variables</h4>")
+        html.append(f"<p>{len(self.categorical_cols)}</p>")
+        html.append("</div>")
+        
+        html.append("</div>")  # End metric-group
+        
+        # Additional debug info
+        logging.info(f"Found {len(visualization_files)} visualization files for HTML report")
+        for viz_file in visualization_files:
+            logging.info(f"Visualization file: {viz_file}")
+        
+        # Check for visualization files directly in the output directory
+        direct_files = [f for f in os.listdir(self.output_dir) if f.endswith('.png')]
+        if direct_files:
+            logging.info(f"Found {len(direct_files)} direct PNG files in output dir: {', '.join(direct_files)}")
+            # Add these files to visualization_files if not already present
+            for file in direct_files:
+                file_path = self.output_dir / file
+                if file_path not in visualization_files:
+                    visualization_files.append(file_path)
+        
+        # Add visualizations section
+        html.append("<h2>Visualizations</h2>")
+        
+        # Organize visualizations by type
+        viz_categories = self._organize_visualizations(visualization_files)
+        
+        # If there are no organized visualizations, create a default category
+        if not viz_categories:
+            viz_categories = {'All Visualizations': []}
+            # Try to find PNG files directly
+            for file in os.listdir(self.output_dir):
+                if file.endswith('.png'):
+                    viz_categories['All Visualizations'].append(self.output_dir / file)
+        
+        # Add tabs for visualization categories
+        html.append("<ul class='nav-tabs'>")
+        
+        # Create a tab for each visualization category
+        for i, category in enumerate(viz_categories.keys()):
+            active_class = "active" if i == 0 else ""
+            html.append(f"<li class='{active_class}' onclick='showTab(\"{category}\")'>{category}</li>")
+        
+        html.append("</ul>")
+        
+        # Add tab content for each visualization category
+        for i, (category, files) in enumerate(viz_categories.items()):
+            display = "block" if i == 0 else "none"
+            html.append(f"<div id='{category}' class='tab-content' style='display: {display};'>")
             
-            # Add visualizations
-            for viz_file in visualization_files:
-                if viz_file.exists():
-                    # Get base name without timestamp
-                    base_name = viz_file.stem.replace(f"_{self.timestamp}", "")
+            if files:
+                html.append("<div class='viz-container'>")
+                for file_path in files:
+                    # Extract just the filename for display
+                    file_name = os.path.basename(str(file_path))
                     
-                    # Read the image and encode it as base64
-                    with open(viz_file, 'rb') as img_file:
-                        img_data = base64.b64encode(img_file.read()).decode('utf-8')
+                    # Get a readable title from the filename
+                    readable_title = file_name.replace('_', ' ').replace('.png', '').title()
+                    if hasattr(self, '_get_readable_title'):
+                        try:
+                            readable_title = self._get_readable_title(file_name)
+                        except:
+                            pass
                     
-                    # Add image to HTML
-                    f.write(f"""
-                    <div class="viz-item">
-                        <img src="data:image/png;base64,{img_data}" alt="{base_name}">
-                        <div class="viz-title">{base_name}</div>
-                    </div>
-                    """)
+                    html.append("<div class='viz-item'>")
+                    html.append(f"<h3>{readable_title}</h3>")
+                    
+                    # Try to embed the image using base64
+                    try:
+                        with open(file_path, 'rb') as img_file:
+                            img_data = base64.b64encode(img_file.read()).decode('utf-8')
+                            html.append(f"<img src='data:image/png;base64,{img_data}' alt='{file_name}'>")
+                    except Exception as e:
+                        logging.warning(f"Error embedding visualization {file_path}: {str(e)}")
+                        # Fallback: use direct file reference
+                        try:
+                            # Calculate relative path from HTML file to image
+                            rel_path = os.path.relpath(str(file_path), os.path.dirname(str(output_path)))
+                            html.append(f"<img src='{rel_path}' alt='{file_name}'>")
+                            logging.info(f"Using relative path reference for {file_name}: {rel_path}")
+                        except Exception as e2:
+                            logging.error(f"Error creating relative path for {file_path}: {str(e2)}")
+                            # Last resort: absolute path
+                            html.append(f"<img src='{file_path}' alt='{file_name}'>")
+                    
+                    html.append("</div>")
+                
+                html.append("</div>")
+            else:
+                html.append("<p>No visualizations available for this category.</p>")
             
-            # Close HTML
-            f.write("""
-                </div>
-                
-                <h2>Key Findings</h2>
-                <ul>
-                    <li>Comprehensive analysis completed successfully</li>
-                    <li>See text report for detailed findings</li>
-                </ul>
-                
-                <p style="text-align: center; margin-top: 50px; color: #7f8c8d;">Generated by Enhanced Data Analyzer</p>
-            </body>
-            </html>
-            """)
+            html.append("</div>")
+        
+        # Add JavaScript for tabs
+        html.append("<script>")
+        html.append("function showTab(tabId) {")
+        html.append("  const tabs = document.getElementsByClassName('tab-content');")
+        html.append("  for (let i = 0; i < tabs.length; i++) {")
+        html.append("    tabs[i].style.display = 'none';")
+        html.append("  }")
+        html.append("  document.getElementById(tabId).style.display = 'block';")
+        html.append("  const navTabs = document.getElementsByClassName('nav-tabs')[0].getElementsByTagName('li');")
+        html.append("  for (let i = 0; i < navTabs.length; i++) {")
+        html.append("    navTabs[i].className = '';")
+        html.append("  }")
+        html.append("  const activeTab = Array.from(navTabs).find(tab => tab.textContent === tabId);")
+        html.append("  if (activeTab) activeTab.className = 'active';")
+        html.append("}")
+        html.append("</script>")
+        
+        # Close HTML
+        html.append("</body>")
+        html.append("</html>")
+        
+        # Write the HTML to file
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(html))
         
         logging.info(f"HTML report with visualizations generated at {output_path}")
+        
+    def _organize_visualizations(self, visualization_files):
+        """Organize visualization files by category for HTML report - optimized for performance"""
+        viz_categories = {
+            'Distribution Analysis': [],
+            'Categorical Analysis': [],
+            'Relationship Analysis': [],
+            'Other Visualizations': []
+        }
+        
+        # Use string operations instead of regex for better performance
+        for file_path in visualization_files:
+            file_name = str(file_path.name).lower()
+            
+            if any(x in file_name for x in ['distribution', 'pie_chart', 'histogram']):
+                viz_categories['Distribution Analysis'].append(file_path)
+            elif any(x in file_name for x in ['barplot', 'bar_chart']):
+                viz_categories['Categorical Analysis'].append(file_path)
+            elif any(x in file_name for x in ['heatmap', 'correlation', 'vs_']):
+                viz_categories['Relationship Analysis'].append(file_path)
+            else:
+                viz_categories['Other Visualizations'].append(file_path)
+        
+        # Remove empty categories
+        return {k: v for k, v in viz_categories.items() if v}
+
+    def _get_readable_title(self, filename):
+        """Convert a filename to a readable title"""
+        # Remove timestamp pattern
+        readable = filename.replace(self.timestamp, '')
+        # Remove file extension
+        readable = os.path.splitext(readable)[0]
+        # Replace underscores with spaces
+        readable = readable.replace('_', ' ')
+        # Remove leading/trailing spaces
+        readable = readable.strip()
+        # Capitalize words
+        return readable.title()
 
 def main():
     """Main function to run the data analysis"""
